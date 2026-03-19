@@ -1,0 +1,21 @@
+#!/bin/bash
+# /etc/keepalived/check_patroni_leader.sh
+
+PATRONI_API="http://{{ ansible_host }}:{{ patroni_port }}"
+TIMEOUT=3
+
+if ! curl -s --max-time $TIMEOUT "$PATRONI_API" > /dev/null; then
+    echo "CRITICAL: Patroni API is not running"
+    exit 2
+fi
+
+role=$(curl -s --max-time $TIMEOUT "$PATRONI_API" | jq -r .role 2>/dev/null)
+state=$(curl -s --max-time $TIMEOUT "$PATRONI_API" | jq -r .state 2>/dev/null)
+
+if [ "$role" = "primary" ] && [ "$state" = "running" ]; then
+    echo "OK: Node leader (Role: $role, State: $state)"
+    exit 0
+else
+    echo "CRITICAL: Node replica (Role: $role, State: $state)"
+    exit 1
+fi

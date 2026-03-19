@@ -1,0 +1,295 @@
+---
+# =============================================================================
+# check.yml — Cluster health check and auto-repair
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini check.yml            # check only
+#   ansible-playbook -i inventory/hosts.ini check.yml -e repair=true  # check + fix
+# =============================================================================
+
+- name: "CHECK — System & LVM"
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  vars:
+    repair: false
+  tasks:
+
+    # ---------- Services ----------
+    - name: "[CHECK] Verify required services are running"
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      register: svc_check
+      loop:
+        - etcd
+        - patroni
+        - keepalived
+      tags: check
+
+    - name: "[CHECK] Report service status"
+      ansible.builtin.debug:
+        msg: >
+          {{ item.item }}: {{ item.status.ActiveState | upper }}
+          {{ '✓' if item.status.ActiveState == 'active' else '✗ NEEDS RESTART' }}
+      loop: "{{ svc_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    - name: "[REPAIR] Restart failed services"
+      ansible.builtin.systemd:
+        name: "{{ item.item }}"
+        state: restarted
+      loop: "{{ svc_check.results }}"
+      when:
+        - repair | bool
+        - item.status.ActiveState != 'active'
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    # ---------- LVM mounts ----------
+    - name: "[CHECK] Verify LVM volume group exists"
+      ansible.builtin.shell: vgs {{ vg_name }} --noheadings 2>&1
+      register: vg_check
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Report VG status"
+      ansible.builtin.debug:
+        msg: "VG {{ vg_name }}: {{ 'EXISTS ✓' if vg_check.rc == 0 else 'MISSING ✗' }}"
+      tags: check
+
+    - name: "[CHECK] Verify critical mountpoints are mounted"
+      ansible.builtin.shell: mountpoint -q {{ item }}
+      register: mount_check
+      loop:
+        - /var/lib/postgresql
+        - /pgwal
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Report mountpoint status"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ 'MOUNTED ✓' if item.rc == 0 else 'NOT MOUNTED ✗' }}"
+      loop: "{{ mount_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    - name: "[REPAIR] Remount missing mountpoints"
+      ansible.builtin.shell: mount {{ item.item }}
+      loop: "{{ mount_check.results }}"
+      when:
+        - repair | bool
+        - item.rc != 0
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    # ---------- Directory ownership ----------
+    - name: "[CHECK] Verify postgres owns data directories"
+      ansible.builtin.shell: |
+        stat -c '%U' {{ item }} 2>/dev/null || echo "missing"
+      register: dir_owner
+      loop:
+        - /var/lib/postgresql
+        - /pgwal
+        - "{{ pg_data_dir }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Report directory ownership"
+      ansible.builtin.debug:
+        msg: >
+          {{ item.item }}: owner={{ item.stdout }}
+          {{ '✓' if item.stdout == 'postgres' else '✗ expected postgres' }}
+      loop: "{{ dir_owner.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    - name: "[REPAIR] Fix directory ownership"
+      ansible.builtin.file:
+        path: "{{ item.item }}"
+        owner: postgres
+        group: postgres
+        recurse: false
+      loop: "{{ dir_owner.results }}"
+      when:
+        - repair | bool
+        - item.stdout != 'postgres'
+        - item.stdout != 'missing'
+      loop_control:
+        label: "{{ item.item }}"
+      tags: check
+
+    # ---------- patronictl alias ----------
+    - name: "[CHECK] Verify patronictl alias is deployed"
+      ansible.builtin.stat:
+        path: /etc/profile.d/patroni_alias.sh
+      register: alias_check
+      tags: check
+
+    - name: "[CHECK] Report alias status"
+      ansible.builtin.debug:
+        msg: "patronictl alias: {{ 'OK ✓' if alias_check.stat.exists else 'MISSING ✗' }}"
+      tags: check
+
+    - name: "[REPAIR] Deploy missing patronictl alias"
+      ansible.builtin.copy:
+        dest: /etc/profile.d/patroni_alias.sh
+        mode: "0644"
+        content: |
+          alias patronictl='patronictl -c /etc/patroni/patroni.yml'
+      when:
+        - repair | bool
+        - not alias_check.stat.exists
+      tags: check
+
+- name: "CHECK — Patroni cluster topology"
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+  vars:
+    repair: false
+  tasks:
+
+    - name: "[CHECK] Get Patroni cluster topology"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list --format json
+      become_user: postgres
+      register: patroni_topology
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Parse and display topology"
+      ansible.builtin.shell: |
+        echo '{{ patroni_topology.stdout }}' | python3 -c "
+        import json, sys
+        try:
+            nodes = json.load(sys.stdin)
+        except:
+            print('ERROR: could not parse patronictl output')
+            sys.exit(1)
+        leader  = [n for n in nodes if n.get('Role') == 'Leader']
+        replicas = [n for n in nodes if n.get('Role') == 'Replica']
+        print(f'Leader  : {len(leader)}  expected 1  {\"OK\" if len(leader)==1 else \"FAIL\"}')
+        print(f'Replicas: {len(replicas)}  expected 2  {\"OK\" if len(replicas)==2 else \"FAIL\"}')
+        for n in nodes:
+            lag = n.get('Lag in MB', 0)
+            print(f'  {n[\"Member\"]:20} {n.get(\"Role\",\"-\"):8} {n.get(\"State\",\"-\"):10} lag={lag}MB')
+        sys.exit(0 if len(leader)==1 and len(replicas)==2 else 1)
+        "
+      register: topology_check
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Topology result"
+      ansible.builtin.debug:
+        msg: "{{ topology_check.stdout_lines }}"
+      tags: check
+
+    - name: "[CHECK] Verify VIP is held by primary"
+      ansible.builtin.shell: ip addr show | grep "{{ pg_vip }}"
+      register: vip_check
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] VIP status"
+      ansible.builtin.debug:
+        msg: "VIP {{ pg_vip }}: {{ 'ACTIVE on primary ✓' if vip_check.rc == 0 else 'NOT on primary ✗ — check keepalived' }}"
+      tags: check
+
+- name: "CHECK — Databases"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+  vars:
+    repair: false
+  tasks:
+
+    - name: "[CHECK] List existing databases"
+      ansible.builtin.shell: |
+        psql -U postgres -Atc "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;"
+      become_user: postgres
+      register: existing_dbs
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Verify expected databases exist"
+      ansible.builtin.debug:
+        msg: >
+          Database {{ item.name }}:
+          {{ 'EXISTS ✓' if item.name in existing_dbs.stdout_lines else 'MISSING ✗' }}
+      loop: "{{ databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: check
+
+    - name: "[CHECK] Identify missing databases"
+      ansible.builtin.set_fact:
+        missing_dbs: "{{ databases | rejectattr('name', 'in', existing_dbs.stdout_lines) | list }}"
+      tags: check
+
+    - name: "[REPAIR] Re-run database initialization for missing databases"
+      ansible.builtin.include_role:
+        name: databases
+      when:
+        - repair | bool
+        - missing_dbs | length > 0
+      tags: check
+
+    - name: "[CHECK] List existing roles"
+      ansible.builtin.shell: |
+        psql -U postgres -Atc "SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg_%' ORDER BY rolname;"
+      become_user: postgres
+      register: existing_roles
+      changed_when: false
+      failed_when: false
+      tags: check
+
+    - name: "[CHECK] Verify expected users exist"
+      ansible.builtin.debug:
+        msg: >
+          User {{ item.1.name }}:
+          {{ 'EXISTS ✓' if item.1.name in existing_roles.stdout_lines else 'MISSING ✗' }}
+      loop: "{{ databases | subelements('users') }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      tags: check
+
+- name: "CHECK — Final Summary"
+  hosts: pg_cluster
+  become: true
+  gather_facts: false
+  tasks:
+
+    - name: "[CHECK] Full status summary"
+      ansible.builtin.shell: |
+        echo "=== {{ inventory_hostname }} ==="
+        echo "etcd     : $(systemctl is-active etcd)"
+        echo "patroni  : $(systemctl is-active patroni)"
+        echo "keepalived: $(systemctl is-active keepalived)"
+        echo "VG       : $(vgs {{ vg_name }} --noheadings -o vg_name 2>/dev/null || echo 'missing')"
+        echo "pg mount : $(mountpoint -q /var/lib/postgresql && echo mounted || echo 'NOT MOUNTED')"
+        echo "wal mount: $(mountpoint -q /pgwal && echo mounted || echo 'NOT MOUNTED')"
+      register: summary
+      changed_when: false
+      tags: check
+
+    - name: "[CHECK] Summary"
+      ansible.builtin.debug:
+        msg: "{{ summary.stdout_lines }}"
+      tags: check

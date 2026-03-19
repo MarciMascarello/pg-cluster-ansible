@@ -1,0 +1,215 @@
+---
+# =============================================================================
+# roles/lvm_setup/tasks/main.yml
+# PURPOSE: Create a single VG (vg_postgres) on 1 additional disk.
+#          Internal LVs: lv_engine, lv_logs, lv_<dbname> per database.
+# =============================================================================
+
+- name: "[LVM] Install LVM2"
+  ansible.builtin.apt:
+    name: lvm2
+    state: present
+    update_cache: true
+  tags: lvm
+
+# ---------- SCSI Bus Rescan ----------
+# Ensures newly attached virtual disks are visible before discovery.
+- name: "[LVM] Rescan SCSI bus to detect newly attached disks"
+  ansible.builtin.shell: |
+    for host in /sys/class/scsi_host/host*; do
+      echo "- - -" > "$host/scan"
+    done
+    sleep 2
+  changed_when: false
+  tags: lvm
+
+# ---------- Free disk discovery ----------
+- name: "[LVM] Identify free disk (no children, no existing PV)"
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import json, subprocess, sys
+
+    # Use lsblk JSON tree — disks with children have partitions/lvm on them
+    result = subprocess.run(
+        ['lsblk', '--json', '-o', 'NAME,TYPE'],
+        capture_output=True, text=True
+    )
+    try:
+        data = json.loads(result.stdout)
+    except Exception as e:
+        print(f"ERROR parsing lsblk output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    for d in data.get('blockdevices', []):
+        if d.get('type') != 'disk':
+            continue
+        if d.get('name', '').startswith('loop'):
+            continue
+        # Skip disks that have any children (partitions, lvm, etc.)
+        if d.get('children'):
+            continue
+        dev = '/dev/' + d['name']
+        # Skip if already an LVM physical volume
+        r = subprocess.run(['pvs', dev], capture_output=True)
+        if r.returncode == 0:
+            continue
+        print(dev)
+    PYEOF
+  register: free_disks_raw
+  changed_when: false
+  tags: lvm
+
+- name: "[LVM] Assert at least one free disk exists"
+  ansible.builtin.assert:
+    that:
+      - free_disks_raw.stdout_lines | length >= 1
+    fail_msg: >
+      FAIL: {{ inventory_hostname }} — No free disk found.
+      Attach 1 additional virtual disk (for VG: {{ vg_name }}) and try again.
+      Note: the disk must have no partitions, no PV, and no filesystem (typically /dev/sdb).
+  tags: lvm
+
+- name: "[LVM] Set pg_disk fact (first free disk)"
+  ansible.builtin.set_fact:
+    pg_disk: "{{ free_disks_raw.stdout_lines | first }}"
+  tags: lvm
+
+- name: "[LVM] Show selected disk"
+  ansible.builtin.debug:
+    msg: "INFO: {{ inventory_hostname }} — Disk selected for {{ vg_name }}: {{ pg_disk }}"
+  tags: lvm
+
+# ---------- VG única ----------
+- name: "[LVM] Create VG {{ vg_name }} on {{ pg_disk }}"
+  community.general.lvg:
+    vg: "{{ vg_name }}"
+    pvs: "{{ pg_disk }}"
+    state: present
+  tags: lvm
+
+# ---------- LV engine (PostgreSQL binários / data) ----------
+- name: "[LVM] Create LV lv_engine ({{ lv_engine_size_gb }}GB)"
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    lv: lv_engine
+    size: "{{ lv_engine_size_gb }}G"
+    state: present
+  tags: lvm
+
+- name: "[LVM] Format lv_engine with ext4"
+  community.general.filesystem:
+    fstype: ext4
+    dev: "/dev/{{ vg_name }}/lv_engine"
+  tags: lvm
+
+- name: "[LVM] Create mountpoint /var/lib/postgresql"
+  ansible.builtin.file:
+    path: /var/lib/postgresql
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: lvm
+
+- name: "[LVM] Mount lv_engine → /var/lib/postgresql"
+  ansible.posix.mount:
+    path: /var/lib/postgresql
+    src: "/dev/{{ vg_name }}/lv_engine"
+    fstype: ext4
+    opts: defaults,noatime
+    state: mounted
+  tags: lvm
+
+# ---------- LV logs (WAL) ----------
+- name: "[LVM] Create LV lv_logs ({{ lv_logs_size_gb }}GB)"
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    lv: lv_logs
+    size: "{{ lv_logs_size_gb }}G"
+    state: present
+  tags: lvm
+
+- name: "[LVM] Format lv_logs with ext4"
+  community.general.filesystem:
+    fstype: ext4
+    dev: "/dev/{{ vg_name }}/lv_logs"
+  tags: lvm
+
+- name: "[LVM] Create mountpoint /pgwal"
+  ansible.builtin.file:
+    path: /pgwal
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: lvm
+
+- name: "[LVM] Mount lv_logs → /pgwal"
+  ansible.posix.mount:
+    path: /pgwal
+    src: "/dev/{{ vg_name }}/lv_logs"
+    fstype: ext4
+    opts: defaults,noatime
+    state: mounted
+  tags: lvm
+
+# ---------- LVs per database (tablespaces) ----------
+- name: "[LVM] Create LV for each database (tablespace)"
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    lv: "lv_{{ item.name }}"
+    size: "{{ item.lv_size_gb }}G"
+    state: present
+  loop: "{{ databases }}"
+  loop_control:
+    label: "lv_{{ item.name }} ({{ item.lv_size_gb }}GB)"
+  tags: lvm
+
+- name: "[LVM] Format database LVs with ext4"
+  community.general.filesystem:
+    fstype: ext4
+    dev: "/dev/{{ vg_name }}/lv_{{ item.name }}"
+  loop: "{{ databases }}"
+  loop_control:
+    label: "lv_{{ item.name }}"
+  tags: lvm
+
+- name: "[LVM] Create tablespace mountpoints /pgdata/<dbname>"
+  ansible.builtin.file:
+    path: "/pgdata/{{ item.name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ databases }}"
+  loop_control:
+    label: "/pgdata/{{ item.name }}"
+  tags: lvm
+
+- name: "[LVM] Mount database LVs → /pgdata/<dbname>"
+  ansible.posix.mount:
+    path: "/pgdata/{{ item.name }}"
+    src: "/dev/{{ vg_name }}/lv_{{ item.name }}"
+    fstype: ext4
+    opts: defaults,noatime
+    state: mounted
+  loop: "{{ databases }}"
+  loop_control:
+    label: "/pgdata/{{ item.name }}"
+  tags: lvm
+
+# ---------- Summary ----------
+- name: "[LVM] Show LVM layout summary"
+  ansible.builtin.debug:
+    msg: |
+      =====================================================================
+      LVM CREATED — {{ inventory_hostname }}
+      VG: {{ vg_name }} on {{ pg_disk }}
+      =====================================================================
+        lv_engine   {{ lv_engine_size_gb }}GB   → /var/lib/postgresql
+        lv_logs     {{ lv_logs_size_gb }}GB   → /pgwal
+      {% for db in databases %}
+        lv_{{ db.name }}   {{ db.lv_size_gb }}GB   → /pgdata/{{ db.name }}
+      {% endfor %}
+      =====================================================================
+  tags: lvm

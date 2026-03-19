@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# roles/validate/tasks/main.yml
+# PURPOSE: Final health check after deployment
+# =============================================================================
+
+- name: "[VALIDATE] Wait for Patroni to be ready"
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ patroni_port }}"
+    timeout: 60
+  tags: validate
+
+- name: "[VALIDATE] Check Patroni cluster status"
+  ansible.builtin.shell: |
+    patronictl -c /etc/patroni/patroni.yml list
+  become: true
+  become_user: postgres
+  register: patronictl_output
+  changed_when: false
+  run_once: true
+  tags: validate
+
+- name: "[VALIDATE] Show cluster topology"
+  ansible.builtin.debug:
+    msg: "{{ patronictl_output.stdout_lines }}"
+  run_once: true
+  tags: validate
+
+- name: "[VALIDATE] Check all services running"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+  register: svc_status
+  loop:
+    - etcd
+    - patroni
+    - keepalived
+  tags: validate
+
+- name: "[VALIDATE] Report service status"
+  ansible.builtin.debug:
+    msg: "{{ item.item }}: {{ item.status.ActiveState }}"
+  loop: "{{ svc_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  tags: validate
+
+- name: "[VALIDATE] Check VIP is active on one node"
+  ansible.builtin.shell: ip addr show | grep "{{ pg_vip }}"
+  register: vip_check
+  changed_when: false
+  ignore_errors: true
+  tags: validate
+
+- name: "[VALIDATE] VIP status"
+  ansible.builtin.debug:
+    msg: "{{ 'VIP ' + pg_vip + ' is ACTIVE on this node' if vip_check.rc == 0 else 'VIP not on this node (may be on another - check all nodes)' }}"
+  tags: validate

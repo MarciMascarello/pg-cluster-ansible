@@ -1,0 +1,97 @@
+---
+# =============================================================================
+# site.yml - Main entrypoint
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini site.yml               # full deploy
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags preflight
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags lvm
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags install
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags configure
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags databases
+#   ansible-playbook -i inventory/hosts.ini site.yml --tags validate
+# =============================================================================
+
+- name: Preflight - Hardware & connectivity checks
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: preflight
+      tags: preflight
+
+- name: LVM - Isolated storage setup
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: lvm_setup
+      tags: lvm
+
+- name: Install - PostgreSQL stack
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: install_pg_stack
+      tags: install
+
+- name: Configure - Patroni, Etcd, Keepalived, UFW
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: configure_cluster
+      tags: configure
+
+- name: Services - Enable and start
+  hosts: pg_cluster
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Enable and start etcd
+      ansible.builtin.systemd:
+        name: etcd
+        state: started
+        enabled: true
+      tags: services
+
+    - name: Enable and start patroni
+      ansible.builtin.systemd:
+        name: patroni
+        state: started
+        enabled: true
+      tags: services
+
+    - name: Enable and start keepalived
+      ansible.builtin.systemd:
+        name: keepalived
+        state: started
+        enabled: true
+      tags: services
+
+- name: Databases - Create tablespaces, databases, users
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+  roles:
+    - role: databases
+      tags: databases
+
+- name: Validate - Cluster health check
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: validate
+      tags: validate
+
+- name: Cleanup - Remove temporary NOPASSWD sudoers entry
+  hosts: pg_cluster
+  become: true
+  gather_facts: false
+  tags: cleanup
+  tasks:
+    - name: Remove temporary NOPASSWD sudoers file
+      ansible.builtin.file:
+        path: "/etc/sudoers.d/{{ ansible_user }}_ansible"
+        state: absent

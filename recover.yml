@@ -1,0 +1,227 @@
+---
+# =============================================================================
+# recover.yml — Full cluster reset and rebuild
+#
+# Use when the cluster is in an inconsistent state (partial install, system ID
+# mismatch, stale Etcd data, etc.).
+#
+# WARNING: This destroys all PostgreSQL data. Run only on a broken cluster.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini recover.yml
+#   ansible-playbook -i inventory/hosts.ini recover.yml --tags reset    # stop+clean only
+#   ansible-playbook -i inventory/hosts.ini recover.yml --tags rebuild  # restart services
+#   ansible-playbook -i inventory/hosts.ini recover.yml --tags databases # recreate databases
+# =============================================================================
+
+# =============================================================================
+# PHASE 1 — Stop all services and wipe state
+# =============================================================================
+- name: "RECOVER [1/4] — Stop services and clean state"
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  tags: reset
+  tasks:
+
+    - name: "[RECOVER] Stop Patroni"
+      ansible.builtin.systemd:
+        name: patroni
+        state: stopped
+      ignore_errors: true
+
+    - name: "[RECOVER] Stop Keepalived"
+      ansible.builtin.systemd:
+        name: keepalived
+        state: stopped
+      ignore_errors: true
+
+    - name: "[RECOVER] Stop Etcd"
+      ansible.builtin.systemd:
+        name: etcd
+        state: stopped
+      ignore_errors: true
+
+    - name: "[RECOVER] Wait for services to stop"
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: "[RECOVER] Wipe Etcd data directory"
+      ansible.builtin.shell: |
+        rm -rf /var/lib/etcd/*
+
+    - name: "[RECOVER] Wipe PostgreSQL data directory"
+      ansible.builtin.shell: |
+        rm -rf {{ pg_data_dir }}
+        mkdir -p {{ pg_data_dir }}
+        chown postgres:postgres {{ pg_data_dir }}
+        chmod 700 {{ pg_data_dir }}
+
+    - name: "[RECOVER] Remove stale tablespace marker directories (PG_*)"
+      ansible.builtin.shell: |
+        find /pgdata -maxdepth 2 -name 'PG_*' -type d -exec rm -rf {} + 2>/dev/null || true
+
+    - name: "[RECOVER] Reset UFW rules"
+      ansible.builtin.shell: |
+        ufw --force reset
+        ufw --force disable
+      changed_when: false
+
+    - name: "[RECOVER] State wiped — summary"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Etcd, PostgreSQL data and UFW rules cleared."
+
+# =============================================================================
+# PHASE 2 — Reapply configuration (patroni.yml, etcd, keepalived, UFW)
+# =============================================================================
+- name: "RECOVER [2/4] — Reapply cluster configuration"
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  tags: rebuild
+  roles:
+    - role: configure_cluster
+
+# =============================================================================
+# PHASE 3 — Start services and wait for cluster to form
+# =============================================================================
+- name: "RECOVER [3/4] — Start services and wait for cluster"
+  hosts: pg_cluster
+  become: true
+  gather_facts: false
+  tags: rebuild
+  tasks:
+
+    - name: "[RECOVER] Start Etcd"
+      ansible.builtin.systemd:
+        name: etcd
+        state: started
+        enabled: true
+
+    - name: "[RECOVER] Wait for Etcd peer port on all nodes"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: "{{ etcd_client_port }}"
+        timeout: 60
+
+    - name: "[RECOVER] Start Patroni"
+      ansible.builtin.systemd:
+        name: patroni
+        state: started
+        enabled: true
+
+    - name: "[RECOVER] Start Keepalived"
+      ansible.builtin.systemd:
+        name: keepalived
+        state: started
+        enabled: true
+
+    - name: "[RECOVER] Wait for Patroni API to be ready"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: "{{ patroni_port }}"
+        timeout: 120
+
+    - name: "[RECOVER] Wait for cluster to elect a leader"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list --format json \
+          | python3 -c "
+        import json, sys
+        nodes = json.load(sys.stdin)
+        leader = [n for n in nodes if n.get('Role') == 'Leader' and n.get('State') == 'running']
+        sys.exit(0 if leader else 1)
+        "
+      become_user: postgres
+      register: cluster_ready
+      retries: 24
+      delay: 5
+      until: cluster_ready.rc == 0
+      changed_when: false
+      run_once: true
+
+    - name: "[RECOVER] Show cluster topology"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list
+      become_user: postgres
+      register: topo
+      changed_when: false
+      run_once: true
+
+    - name: "[RECOVER] Topology"
+      ansible.builtin.debug:
+        msg: "{{ topo.stdout_lines }}"
+      run_once: true
+
+# =============================================================================
+# PHASE 4 — Ensure inventory primary is the Patroni leader (switchover if needed)
+# =============================================================================
+- name: "RECOVER [4/4a] — Ensure pg_primary is the Patroni leader"
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+  tags: databases
+  tasks:
+
+    - name: "[RECOVER] Check if this node is already the leader"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list --format json | python3 -c "
+        import json, sys
+        nodes = json.load(sys.stdin)
+        me = [n for n in nodes if n.get('Member') == '{{ pg_node_name }}' and n.get('Role') == 'Leader']
+        sys.exit(0 if me else 1)
+        "
+      become_user: postgres
+      register: is_leader
+      changed_when: false
+      failed_when: false
+
+    - name: "[RECOVER] Get current leader name"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list --format json | python3 -c "
+        import json, sys
+        nodes = json.load(sys.stdin)
+        leader = [n for n in nodes if n.get('Role') == 'Leader']
+        print(leader[0]['Member'] if leader else '')
+        "
+      become_user: postgres
+      register: current_leader
+      changed_when: false
+      when: is_leader.rc != 0
+
+    - name: "[RECOVER] Switchover — promote {{ pg_node_name }} to leader"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml switchover \
+          --master {{ current_leader.stdout }} \
+          --candidate {{ pg_node_name }} \
+          --force
+      become_user: postgres
+      when:
+        - is_leader.rc != 0
+        - current_leader.stdout | length > 0
+
+    - name: "[RECOVER] Wait for this node to become leader"
+      ansible.builtin.shell: |
+        patronictl -c /etc/patroni/patroni.yml list --format json | python3 -c "
+        import json, sys
+        nodes = json.load(sys.stdin)
+        me = [n for n in nodes if n.get('Member') == '{{ pg_node_name }}' and n.get('Role') == 'Leader']
+        sys.exit(0 if me else 1)
+        "
+      become_user: postgres
+      register: leader_check
+      retries: 12
+      delay: 5
+      until: leader_check.rc == 0
+      changed_when: false
+      when: is_leader.rc != 0
+
+# =============================================================================
+# PHASE 5 — Recreate databases, tablespaces and users
+# =============================================================================
+- name: "RECOVER [4/4b] — Recreate databases"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+  tags: databases
+  roles:
+    - role: databases

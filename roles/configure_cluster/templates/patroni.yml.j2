@@ -1,0 +1,87 @@
+# templates/patroni.yml.j2
+scope: {{ cluster_scope }}
+namespace: /db/
+name: {{ pg_node_name }}
+
+restapi:
+  listen: 0.0.0.0:{{ patroni_port }}
+  connect_address: {{ ansible_host }}:{{ patroni_port }}
+
+etcd3:
+  hosts:
+{% for host in groups['pg_cluster'] %}
+    - {{ hostvars[host]['ansible_host'] }}:{{ etcd_client_port }}
+{% endfor %}
+  protocol: http
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        shared_preload_libraries: 'pg_stat_statements'
+        timezone: 'UTC'
+        shared_buffers: '{{ (ansible_memtotal_mb * 0.25) | int }}MB'
+        work_mem: 16MB
+        max_connections: 500
+        wal_log_hints: "on"
+  initdb:
+    - encoding: UTF-8
+    - data-checksums
+  pg_hba:
+{% for host in groups['pg_cluster'] %}
+    - host replication replicator {{ hostvars[host]['ansible_host'] }}/32 md5
+{% endfor %}
+    - host replication replicator {{ cluster_subnet }} md5
+{% for net in client_networks %}
+{% for db in databases %}
+{% for user in db.users %}
+    - host {{ db.name }} {{ user.name }} {{ net }} md5
+{% endfor %}
+{% endfor %}
+{% endfor %}
+    - host all postgres 127.0.0.1/32 trust
+    - host all all {{ cluster_subnet }} md5
+    - host all all 0.0.0.0/0 md5
+  users:
+    admin:
+      password: {{ pg_admin_password }}
+      options:
+        - createrole
+        - createdb
+    replicator:
+      password: {{ pg_replicator_password }}
+      options:
+        - replication
+
+postgresql:
+  cluster_name: {{ cluster_name }}
+  listen: 0.0.0.0:{{ pg_port }}
+  connect_address: {{ ansible_host }}:{{ pg_port }}
+  data_dir: {{ pg_data_dir }}
+  bin_dir: {{ pg_bin_dir }}
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: {{ pg_replicator_password }}
+    superuser:
+      username: postgres
+      password: {{ pg_superuser_password }}
+  parameters:
+    unix_socket_directories: "/var/run/postgresql/"
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

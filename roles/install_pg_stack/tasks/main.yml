@@ -1,0 +1,160 @@
+---
+# =============================================================================
+# roles/install_pg_stack/tasks/main.yml
+# PURPOSE: Install PostgreSQL, Patroni, Etcd, Keepalived
+# =============================================================================
+
+- name: "[INSTALL] Update apt cache"
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  tags: install
+
+- name: "[INSTALL] Install base packages"
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg
+      - lsb-release
+      - python3
+      - python3-pip
+      - python3-venv
+      - python3-psycopg2
+      - jq
+      - pipx
+      - etcd-server
+      - keepalived
+      - ufw
+    state: present
+  tags: install
+
+- name: "[INSTALL] Add PostgreSQL APT key"
+  ansible.builtin.shell: |
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+  args:
+    creates: /etc/apt/trusted.gpg.d/pgdg.gpg
+  tags: install
+
+- name: "[INSTALL] Add PostgreSQL APT repository"
+  ansible.builtin.apt_repository:
+    repo: "deb https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+    state: present
+    filename: pgdg
+  tags: install
+
+- name: "[INSTALL] Install PostgreSQL {{ pg_version }}"
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ pg_version }}"
+      - "postgresql-client-{{ pg_version }}"
+      - "postgresql-contrib-{{ pg_version }}"
+    state: present
+    update_cache: true
+  tags: install
+
+- name: "[INSTALL] Stop and disable default PostgreSQL service (Patroni will manage it)"
+  ansible.builtin.systemd:
+    name: postgresql
+    state: stopped
+    enabled: false
+  ignore_errors: true
+  tags: install
+
+- name: "[INSTALL] Install Patroni via pip3 (system-wide, accessible by postgres user)"
+  ansible.builtin.pip:
+    name: "patroni[etcd3,psycopg]"
+    executable: pip3
+    extra_args: "--break-system-packages"
+    state: present
+  tags: install
+
+- name: "[INSTALL] Ensure patroni binaries are executable"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    mode: "0755"
+  loop:
+    - /usr/local/bin/patroni
+    - /usr/local/bin/patronictl
+  ignore_errors: true
+  tags: install
+
+- name: "[INSTALL] Create Patroni config directory"
+  ansible.builtin.file:
+    path: /etc/patroni
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+  tags: install
+
+- name: "[INSTALL] Create PostgreSQL data directory"
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  tags: install
+
+# ---------- Ownership on mountpoints ----------
+- name: "[INSTALL] Set postgres ownership on engine mountpoint"
+  ansible.builtin.file:
+    path: /var/lib/postgresql
+    owner: postgres
+    group: postgres
+    mode: "0750"
+    state: directory
+  tags: install
+
+- name: "[INSTALL] Set postgres ownership on WAL mountpoint"
+  ansible.builtin.file:
+    path: /pgwal
+    owner: postgres
+    group: postgres
+    mode: "0750"
+    state: directory
+  tags: install
+
+- name: "[INSTALL] Set postgres ownership on database tablespace dirs"
+  ansible.builtin.file:
+    path: "/pgdata/{{ item.name }}"
+    owner: postgres
+    group: postgres
+    mode: "0750"
+    state: directory
+  loop: "{{ databases }}"
+  loop_control:
+    label: "/pgdata/{{ item.name }}"
+  tags: install
+
+# ---------- SSH key for the postgres user (optional) ----------
+- name: "[INSTALL] Setup postgres user SSH key"
+  when: postgres_ssh_public_key | default('') | length > 0
+  block:
+    - name: "[INSTALL] Create .ssh directory for postgres"
+      ansible.builtin.file:
+        path: /var/lib/postgresql/.ssh
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    - name: "[INSTALL] Add public key to postgres authorized_keys"
+      ansible.builtin.lineinfile:
+        path: /var/lib/postgresql/.ssh/authorized_keys
+        line: "{{ postgres_ssh_public_key }}"
+        create: true
+        owner: postgres
+        group: postgres
+        mode: "0600"
+  tags: install
+
+# ---------- patronictl alias (all users) ----------
+- name: "[INSTALL] Deploy patronictl alias to /etc/profile.d"
+  ansible.builtin.copy:
+    dest: /etc/profile.d/patroni_alias.sh
+    mode: "0644"
+    content: |
+      # patronictl shortcut — no need to specify config file every time
+      alias patronictl='patronictl -c /etc/patroni/patroni.yml'
+  tags: install

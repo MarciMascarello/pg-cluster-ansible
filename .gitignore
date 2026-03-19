@@ -1,0 +1,9 @@
+# Generated files containing passwords and server-specific data
+group_vars/all.yml
+inventory/hosts.ini
+
+# Credential summary written by setup.sh
+key.recap.txt
+
+# Ansible retry files
+*.retry

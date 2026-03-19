@@ -1,0 +1,10 @@
+# templates/etcd.j2
+ETCD_NAME="{{ etcd_name }}"
+ETCD_DATA_DIR="/var/lib/etcd/default.etcd"
+ETCD_LISTEN_PEER_URLS="http://{{ ansible_host }}:{{ etcd_peer_port }}"
+ETCD_LISTEN_CLIENT_URLS="http://{{ ansible_host }}:{{ etcd_client_port }},http://127.0.0.1:{{ etcd_client_port }}"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ ansible_host }}:{{ etcd_peer_port }}"
+ETCD_ADVERTISE_CLIENT_URLS="http://{{ ansible_host }}:{{ etcd_client_port }}"
+ETCD_INITIAL_CLUSTER="{% for host in groups['pg_cluster'] %}{{ hostvars[host]['etcd_name'] }}=http://{{ hostvars[host]['ansible_host'] }}:{{ etcd_peer_port }}{% if not loop.last %},{% endif %}{% endfor %}"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="{{ cluster_name }}-etcd"

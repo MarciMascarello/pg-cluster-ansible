@@ -1,0 +1,175 @@
+---
+# =============================================================================
+# roles/preflight/tasks/main.yml
+# PURPOSE: Validate hardware and OS prerequisites BEFORE any installation.
+# =============================================================================
+
+- name: "[PREFLIGHT] Gather facts"
+  ansible.builtin.setup:
+  tags: preflight
+
+# ---------- SCSI Bus Rescan ----------
+# Required when a new virtual disk was added to the VM but the OS hasn't detected it yet.
+- name: "[PREFLIGHT] Rescan SCSI bus to detect newly attached disks"
+  ansible.builtin.shell: |
+    for host in /sys/class/scsi_host/host*; do
+      echo "- - -" > "$host/scan"
+    done
+    sleep 2
+  changed_when: false
+  tags: preflight
+
+- name: "[PREFLIGHT] Detect primary network interface"
+  ansible.builtin.set_fact:
+    detected_iface: "{{ ansible_default_ipv4.interface }}"
+  tags: preflight
+
+- name: "[PREFLIGHT] Show detected interface"
+  ansible.builtin.debug:
+    msg: "INFO: {{ inventory_hostname }} — detected interface: '{{ detected_iface }}'"
+  tags: preflight
+
+# ---------- OS Check ----------
+- name: "[PREFLIGHT] Check OS is Ubuntu 22.04 or 24.04"
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Ubuntu"
+      - ansible_distribution_major_version | int >= 22
+    fail_msg: "FAIL: {{ inventory_hostname }} — OS: {{ ansible_distribution }} {{ ansible_distribution_version }}. Requires Ubuntu 22.04+."
+    success_msg: "OK: {{ inventory_hostname }} — OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+  tags: preflight
+
+# ---------- RAM Check ----------
+- name: "[PREFLIGHT] Check minimum RAM (4GB)"
+  ansible.builtin.assert:
+    that:
+      - ansible_memtotal_mb >= 4096
+    fail_msg: "FAIL: {{ inventory_hostname }} — RAM: {{ ansible_memtotal_mb }}MB. Minimum required: 4096MB."
+    success_msg: "OK: {{ inventory_hostname }} — RAM: {{ ansible_memtotal_mb }}MB"
+  tags: preflight
+
+# ---------- CPU Check ----------
+- name: "[PREFLIGHT] Check minimum CPU cores (2)"
+  ansible.builtin.assert:
+    that:
+      - ansible_processor_vcpus >= 2
+    fail_msg: "FAIL: {{ inventory_hostname }} — vCPUs: {{ ansible_processor_vcpus }}. Minimum required: 2."
+    success_msg: "OK: {{ inventory_hostname }} — vCPUs: {{ ansible_processor_vcpus }}"
+  tags: preflight
+
+# ---------- Disk Discovery ----------
+- name: "[PREFLIGHT] List all block devices"
+  ansible.builtin.shell: |
+    lsblk -d -o NAME,SIZE,TYPE,MOUNTPOINT --json | python3 -c "
+    import sys, json
+    data = json.load(sys.stdin)
+    disks = [d for d in data['blockdevices']
+             if d['type'] == 'disk'
+             and not d['name'].startswith('loop')
+             and (d.get('mountpoint') is None or d.get('mountpoint') == '')]
+    print(json.dumps(disks))
+    "
+  register: raw_disks
+  changed_when: false
+  tags: preflight
+
+- name: "[PREFLIGHT] Parse free (unused) disks"
+  ansible.builtin.set_fact:
+    free_disks: "{{ raw_disks.stdout | from_json }}"
+  tags: preflight
+
+- name: "[PREFLIGHT] Show discovered free disks"
+  ansible.builtin.debug:
+    msg: >
+      INFO: {{ inventory_hostname }} — Free disks found: {{ free_disks | length }}.
+      Names: {{ free_disks | map(attribute='name') | list }}
+  tags: preflight
+
+# ---------- Disk Quantity Check (1 disk for vg_postgres) ----------
+- name: "[PREFLIGHT] Check at least 1 free disk available"
+  ansible.builtin.assert:
+    that:
+      - free_disks | length >= 1
+    fail_msg: >
+      FAIL: {{ inventory_hostname }} — No free disk found.
+      Attach 1 additional virtual disk to the host (VG: vg_postgres) and try again.
+    success_msg: >
+      OK: {{ inventory_hostname }} — {{ free_disks | length }} free disk(s) available.
+  ignore_errors: true
+  register: disk_check_result
+  tags: preflight
+
+# ---------- LVM sizing recommendation ----------
+- name: "[PREFLIGHT] Calculate minimum disk size required"
+  ansible.builtin.set_fact:
+    min_disk_gb: "{{ lv_engine_size_gb | int + lv_logs_size_gb | int + (databases | map(attribute='lv_size_gb') | map('int') | sum) }}"
+  tags: preflight
+
+- name: "[PREFLIGHT] Show LVM disk sizing recommendation"
+  ansible.builtin.debug:
+    msg: |
+      =====================================================================
+      DISK SIZING RECOMMENDATION FOR {{ inventory_hostname }}
+      =====================================================================
+      Single VG: vg_postgres
+      1 additional disk with at least {{ min_disk_gb }}GB
+
+      Planned LVs:
+        lv_engine   {{ lv_engine_size_gb }}GB   → /var/lib/postgresql
+        lv_logs     {{ lv_logs_size_gb }}GB   → /pgwal
+      {% for db in databases %}
+        lv_{{ db.name }}   {{ db.lv_size_gb }}GB   → /pgdata/{{ db.name }}
+      {% endfor %}
+      =====================================================================
+  tags: preflight
+
+# ---------- Connectivity Check ----------
+- name: "[PREFLIGHT] Check inter-node connectivity (SSH port 22)"
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item]['ansible_host'] }}"
+    port: 22
+    timeout: 5
+  loop: "{{ groups['pg_cluster'] | difference([inventory_hostname]) }}"
+  register: conn_check
+  ignore_errors: true
+  tags: preflight
+
+- name: "[PREFLIGHT] Report connectivity result"
+  ansible.builtin.debug:
+    msg: >
+      {{ 'OK' if not (item.failed | default(false)) else 'FAIL' }}:
+      {{ inventory_hostname }} → {{ item.item }}: SSH
+      {{ 'reachable' if not (item.failed | default(false)) else 'UNREACHABLE — check network/firewall' }}
+  loop: "{{ conn_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  tags: preflight
+
+# ---------- VG Status ----------
+- name: "[PREFLIGHT] Check existing VG status"
+  ansible.builtin.shell: vgs --noheadings -o vg_name,vg_free --units g 2>/dev/null || echo "no_vg_found"
+  register: vg_info
+  changed_when: false
+  tags: preflight
+
+- name: "[PREFLIGHT] Show current VG status"
+  ansible.builtin.debug:
+    msg: "INFO: {{ inventory_hostname }} — Existing VGs: {{ vg_info.stdout_lines }}"
+  tags: preflight
+
+# ---------- Summary ----------
+- name: "[PREFLIGHT] Final summary"
+  ansible.builtin.debug:
+    msg: |
+      =====================================================================
+      PREFLIGHT SUMMARY — {{ inventory_hostname }}
+      =====================================================================
+      OS           : {{ ansible_distribution }} {{ ansible_distribution_version }} ✓
+      RAM          : {{ ansible_memtotal_mb }}MB
+      vCPUs        : {{ ansible_processor_vcpus }}
+      Interface    : {{ detected_iface }}
+      Free disks   : {{ free_disks | length }} found
+      Min disk size: {{ min_disk_gb }}GB for vg_postgres
+      Disk status  : {{ "READY" if not disk_check_result.failed else "ADD DISK — see above" }}
+      =====================================================================
+  tags: preflight

@@ -1,0 +1,23 @@
+---
+# roles/configure_cluster/handlers/main.yml
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart patroni
+  ansible.builtin.systemd:
+    name: patroni
+    state: restarted
+    enabled: true
+
+- name: restart etcd
+  ansible.builtin.systemd:
+    name: etcd
+    state: restarted
+    enabled: true
+
+- name: restart keepalived
+  ansible.builtin.systemd:
+    name: keepalived
+    state: restarted
+    enabled: true

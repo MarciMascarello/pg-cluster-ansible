@@ -1,0 +1,125 @@
+---
+# =============================================================================
+# roles/configure_cluster/tasks/main.yml
+# PURPOSE: Deploy /etc/hosts, patroni.yml, etcd, keepalived, UFW
+# =============================================================================
+
+# ---------- UFW reset (flush any pre-existing rules from OS template) ----------
+- name: "[CONFIG] Disable and reset UFW before applying cluster rules"
+  ansible.builtin.shell: |
+    ufw --force reset
+    ufw --force disable
+  changed_when: false
+  tags: configure, ufw
+
+# ---------- /etc/hosts ----------
+- name: "[CONFIG] Update /etc/hosts with cluster nodes"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item]['ansible_host'] }} {{ item }}"
+    regexp: ".*{{ item }}$"
+    state: present
+  loop: "{{ groups['pg_cluster'] }}"
+  tags: configure
+
+# ---------- Patroni ----------
+- name: "[CONFIG] Deploy patroni.yml"
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: /etc/patroni/patroni.yml
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: restart patroni
+  tags: configure
+
+- name: "[CONFIG] Deploy patroni systemd unit"
+  ansible.builtin.template:
+    src: patroni.service.j2
+    dest: /etc/systemd/system/patroni.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart patroni
+  tags: configure
+
+# ---------- Etcd ----------
+- name: "[CONFIG] Deploy etcd configuration"
+  ansible.builtin.template:
+    src: etcd.j2
+    dest: /etc/default/etcd
+    mode: "0644"
+  notify: restart etcd
+  tags: configure
+
+# ---------- Keepalived ----------
+- name: "[CONFIG] Deploy keepalived.conf"
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: "0644"
+  notify: restart keepalived
+  tags: configure
+
+- name: "[CONFIG] Deploy check_patroni_leader.sh"
+  ansible.builtin.template:
+    src: check_patroni_leader.sh.j2
+    dest: /etc/keepalived/check_patroni_leader.sh
+    mode: "0755"
+  tags: configure
+
+# ---------- UFW ----------
+- name: "[CONFIG] Configure UFW rules"
+  block:
+    - name: Allow SSH
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Allow PostgreSQL from client networks
+      community.general.ufw:
+        rule: allow
+        port: "{{ pg_port }}"
+        proto: tcp
+        src: "{{ item }}"
+      loop: "{{ client_networks }}"
+
+    - name: Allow PostgreSQL from cluster subnet
+      community.general.ufw:
+        rule: allow
+        port: "{{ pg_port }}"
+        proto: tcp
+        src: "{{ cluster_subnet }}"
+
+    - name: Allow Patroni REST API from cluster
+      community.general.ufw:
+        rule: allow
+        port: "{{ patroni_port }}"
+        proto: tcp
+        src: "{{ cluster_subnet }}"
+
+    - name: Allow Etcd client port from cluster
+      community.general.ufw:
+        rule: allow
+        port: "{{ etcd_client_port }}"
+        proto: tcp
+        src: "{{ cluster_subnet }}"
+
+    - name: Allow Etcd peer port from cluster
+      community.general.ufw:
+        rule: allow
+        port: "{{ etcd_peer_port }}"
+        proto: tcp
+        src: "{{ cluster_subnet }}"
+
+    - name: Allow VRRP protocol (keepalived)
+      community.general.ufw:
+        rule: allow
+        proto: vrrp
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+        policy: deny
+  tags: configure, ufw

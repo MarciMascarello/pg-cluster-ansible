@@ -1,0 +1,41 @@
+# templates/keepalived.conf.j2
+global_defs {
+    script_security
+}
+
+vrrp_script check_patroni {
+    script "/etc/keepalived/check_patroni_leader.sh"
+    interval 2
+    timeout 2
+    weight {{ keepalived_weight }}
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_PG {
+    state BACKUP
+    interface {{ ansible_default_ipv4.interface }}
+    virtual_router_id {{ virtual_router_id }}
+    priority {{ keepalived_priority_base }}
+    advert_int 1
+    unicast_src_ip {{ ansible_host }}
+    unicast_peer {
+{% for host in groups['pg_cluster'] %}
+{% if hostvars[host]['ansible_host'] != ansible_host %}
+        {{ hostvars[host]['ansible_host'] }}
+{% endif %}
+{% endfor %}
+    }
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_auth_pass }}
+    }
+    virtual_ipaddress {
+        {{ pg_vip_cidr }}
+    }
+    track_script {
+        check_patroni
+    }
+    garp_master_delay 1
+    garp_master_refresh 5
+}
