@@ -83,6 +83,18 @@
     msg: "{{ sql_result.stdout_lines }}"
   tags: databases
 
+# ---------- pgvector extension ----------
+- name: "[DB] Enable pgvector extension"
+  ansible.builtin.shell: |
+    psql -U postgres -d {{ item.name }} -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>&1
+  become_user: postgres
+  loop: "{{ databases | selectattr('pgvector', 'defined') | selectattr('pgvector') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: install_pgvector | default(false)
+  changed_when: false
+  tags: databases
+
 # ---------- Schema-level grants (must run connected to each database) ----------
 - name: "[DB] Apply schema-level grants per database"
   ansible.builtin.shell: |
