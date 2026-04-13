@@ -20,21 +20,23 @@
     timeout: 120
   tags: databases
 
-- name: "[DB] Wait for Patroni to confirm this node is primary"
+- name: "[DB] Wait for Patroni to confirm THIS node is primary"
   ansible.builtin.shell: |
-    patronictl -c /etc/patroni/patroni.yml list --format json \
-      | python3 -c "
-    import json, sys
-    nodes = json.load(sys.stdin)
-    primary = [n for n in nodes if n.get('Role') == 'Leader' and n.get('State') == 'running']
-    sys.exit(0 if primary else 1)
-    "
-  become_user: postgres
+    curl -sf http://127.0.0.1:{{ patroni_port }}/leader
   register: patroni_ready
   retries: 20
   delay: 6
   until: patroni_ready.rc == 0
   changed_when: false
+  tags: databases
+
+- name: "[DB] Abort if this node is not the Patroni leader"
+  ansible.builtin.fail:
+    msg: >
+      This node ({{ inventory_hostname }}) is not the Patroni leader.
+      Run: patronictl -c /etc/patroni/patroni.yml list
+      to find the current leader and update [pg_primary] in inventory/hosts.ini.
+  when: patroni_ready.rc != 0
   tags: databases
 
 # ---------- Ensure tablespace directories exist and are owned by postgres ----------
