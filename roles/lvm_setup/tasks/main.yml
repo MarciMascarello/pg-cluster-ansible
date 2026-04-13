@@ -12,8 +12,23 @@
     update_cache: true
   tags: lvm
 
-# ---------- SCSI Bus Rescan ----------
-# Ensures newly attached virtual disks are visible before discovery.
+# ---------- Check if VG already exists ----------
+- name: "[LVM] Check if VG {{ vg_name }} already exists"
+  ansible.builtin.command: vgs {{ vg_name }}
+  register: vg_exists
+  changed_when: false
+  failed_when: false
+  tags: lvm
+
+- name: "[LVM] Show VG status"
+  ansible.builtin.debug:
+    msg: >
+      INFO: {{ inventory_hostname }} — VG '{{ vg_name }}':
+      {{ 'already exists, skipping disk discovery and VG creation.' if vg_exists.rc == 0
+         else 'not found, will create from free disk.' }}
+  tags: lvm
+
+# ---------- SCSI Bus Rescan (only needed when creating VG) ----------
 - name: "[LVM] Rescan SCSI bus to detect newly attached disks"
   ansible.builtin.shell: |
     for host in /sys/class/scsi_host/host*; do
@@ -21,9 +36,10 @@
     done
     sleep 2
   changed_when: false
+  when: vg_exists.rc != 0
   tags: lvm
 
-# ---------- Free disk discovery ----------
+# ---------- Free disk discovery (only when VG does not exist) ----------
 - name: "[LVM] Identify free disk (no children, no existing PV)"
   ansible.builtin.shell: |
     python3 << 'PYEOF'
@@ -57,6 +73,7 @@
     PYEOF
   register: free_disks_raw
   changed_when: false
+  when: vg_exists.rc != 0
   tags: lvm
 
 - name: "[LVM] Assert at least one free disk exists"
@@ -67,16 +84,19 @@
       FAIL: {{ inventory_hostname }} — No free disk found.
       Attach 1 additional virtual disk (for VG: {{ vg_name }}) and try again.
       Note: the disk must have no partitions, no PV, and no filesystem (typically /dev/sdb).
+  when: vg_exists.rc != 0
   tags: lvm
 
 - name: "[LVM] Set pg_disk fact (first free disk)"
   ansible.builtin.set_fact:
     pg_disk: "{{ free_disks_raw.stdout_lines | first }}"
+  when: vg_exists.rc != 0
   tags: lvm
 
 - name: "[LVM] Show selected disk"
   ansible.builtin.debug:
     msg: "INFO: {{ inventory_hostname }} — Disk selected for {{ vg_name }}: {{ pg_disk }}"
+  when: vg_exists.rc != 0
   tags: lvm
 
 # ---------- VG única ----------
@@ -85,6 +105,7 @@
     vg: "{{ vg_name }}"
     pvs: "{{ pg_disk }}"
     state: present
+  when: vg_exists.rc != 0
   tags: lvm
 
 # ---------- LV engine (PostgreSQL binários / data) ----------
