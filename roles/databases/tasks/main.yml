@@ -50,13 +50,27 @@
     label: "/pgdata/{{ item.name }}"
   tags: databases
 
-# ---------- Clean stale tablespace marker dirs from previous cluster init ----------
-- name: "[DB] Remove stale PostgreSQL tablespace marker directories (PG_*)"
+# ---------- Detect which databases do not yet exist ----------
+- name: "[DB] Check which databases already exist"
   ansible.builtin.shell: |
-    find /pgdata/{{ item.name }} -maxdepth 1 -name 'PG_*' -type d -exec rm -rf {} + 2>/dev/null || true
+    psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '{{ item.name }}'"
+  become_user: postgres
   loop: "{{ databases }}"
   loop_control:
-    label: "/pgdata/{{ item.name }}"
+    label: "{{ item.name }}"
+  register: db_existence
+  changed_when: false
+  tags: databases
+
+# ---------- Clean stale tablespace marker dirs — ONLY for databases that do not exist yet ----------
+# WARNING: Never run on existing databases — PG_* dirs contain live tablespace data.
+- name: "[DB] Remove stale PostgreSQL tablespace marker directories (PG_*)"
+  ansible.builtin.shell: |
+    find /pgdata/{{ item.item.name }} -maxdepth 1 -name 'PG_*' -type d -exec rm -rf {} + 2>/dev/null || true
+  loop: "{{ db_existence.results }}"
+  loop_control:
+    label: "/pgdata/{{ item.item.name }}"
+  when: item.stdout == ""
   changed_when: false
   tags: databases
 
