@@ -224,8 +224,8 @@
   ansible.builtin.debug:
     msg: |
       =====================================================================
-      LVM CREATED — {{ inventory_hostname }}
-      VG: {{ vg_name }} on {{ pg_disk }}
+      LVM READY — {{ inventory_hostname }}
+      VG: {{ vg_name }}{{ ' on ' + pg_disk if pg_disk is defined else ' (pre-existing)' }}
       =====================================================================
         lv_engine   {{ lv_engine_size_gb }}GB   → /var/lib/postgresql
         lv_logs     {{ lv_logs_size_gb }}GB   → /pgwal
