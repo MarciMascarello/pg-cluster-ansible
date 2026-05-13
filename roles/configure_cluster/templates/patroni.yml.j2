@@ -24,10 +24,13 @@ bootstrap:
       use_pg_rewind: true
       use_slots: true
       parameters:
-        wal_level: replica
+        wal_level: "{{ pg_wal_level | default('replica') }}"
         hot_standby: "on"
         max_wal_senders: 10
         max_replication_slots: 10
+{% if pg_synchronized_standby_slots | default('') | length > 0 %}
+        synchronized_standby_slots: "{{ pg_synchronized_standby_slots }}"
+{% endif %}
         shared_preload_libraries: 'pg_stat_statements'
         timezone: 'UTC'
         shared_buffers: '{{ (ansible_memtotal_mb * 0.25) | int }}MB'

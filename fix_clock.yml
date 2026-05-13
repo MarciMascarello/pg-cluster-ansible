@@ -1,0 +1,62 @@
+---
+# =============================================================================
+# fix_clock.yml — Force NTP clock sync on all cluster nodes
+#
+# Garante que ntpsec está configurado com makestep e iburst nos servidores
+# internos, forçando step correction imediata ao reiniciar.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini fix_clock.yml
+# =============================================================================
+
+- name: "FIX CLOCK — Align NTP on all cluster nodes"
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  tasks:
+
+    - name: "[CLOCK] Ensure makestep is configured (step offsets > 1s on startup)"
+      ansible.builtin.lineinfile:
+        path: /etc/ntpsec/ntp.conf
+        regexp: '^makestep'
+        line: 'makestep 1.0 3'
+        insertafter: EOF
+      notify: restart ntpsec
+
+    - name: "[CLOCK] Ensure pool.ntp.org servers are configured with iburst"
+      ansible.builtin.blockinfile:
+        path: /etc/ntpsec/ntp.conf
+        marker: "# {mark} ANSIBLE MANAGED — pool.ntp.org"
+        block: |
+          pool 0.pool.ntp.org iburst
+          pool 1.pool.ntp.org iburst
+          pool 2.pool.ntp.org iburst
+          pool 3.pool.ntp.org iburst
+      notify: restart ntpsec
+
+    - name: "[CLOCK] Flush handlers — restart ntpsec now"
+      ansible.builtin.meta: flush_handlers
+
+    - name: "[CLOCK] Wait for ntpsec to step the clock"
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: "[CLOCK] Report time and sync status"
+      ansible.builtin.shell: |
+        echo "host     : {{ inventory_hostname }}"
+        echo "datetime : $(date '+%Y-%m-%d %H:%M:%S.%3N %Z')"
+        echo "synced   : $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
+        echo "offset   : $(ntpq -c rv 2>/dev/null | grep -oP 'offset=\K[^,]+' || echo n/a)"
+      register: clock_status
+      changed_when: false
+
+    - name: "[CLOCK] Status"
+      ansible.builtin.debug:
+        msg: "{{ clock_status.stdout_lines }}"
+
+  handlers:
+    - name: restart ntpsec
+      ansible.builtin.systemd:
+        name: ntpsec
+        state: restarted
+        enabled: true
