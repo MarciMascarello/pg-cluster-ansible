@@ -86,11 +86,14 @@
       ansible.builtin.set_fact:
         _wal_level_target: "{{ pg_wal_level | default('logical') }}"
 
-    - name: "[CONFIG] Patch wal_level no DCS"
+    - name: "[CONFIG] Aplicar wal_level={{ _wal_level_target }} no DCS"
       ansible.builtin.shell: |
-        patronictl -c /etc/patroni/patroni.yml edit-config \
-          --patch '{"postgresql": {"parameters": {"wal_level": "{{ _wal_level_target }}"}}}' \
-          --force
+        patronictl -c /etc/patroni/patroni.yml show-config | python3 -c "
+        import sys, yaml
+        config = yaml.safe_load(sys.stdin) or {}
+        config.setdefault('postgresql', {}).setdefault('parameters', {})['wal_level'] = '{{ _wal_level_target }}'
+        print(yaml.dump(config, default_flow_style=False))
+        " | patronictl -c /etc/patroni/patroni.yml edit-config --replace - --force
       become_user: postgres
       register: edit_result
       changed_when: "'No changes to apply' not in edit_result.stdout"
