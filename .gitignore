@@ -7,3 +7,6 @@ key.recap.txt
 
 # Ansible retry files
 *.retry
+
+# Claude Code
+.claude/
