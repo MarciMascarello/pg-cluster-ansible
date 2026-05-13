@@ -23,6 +23,10 @@
   run_once: true
   tasks:
 
+    - name: "[PREFLIGHT] Resolver variável alvo"
+      ansible.builtin.set_fact:
+        _wal_level_target: "{{ pg_wal_level | default('logical') }}"
+
     - name: "[PREFLIGHT] Aguardar Patroni API responder"
       ansible.builtin.wait_for:
         host: "127.0.0.1"
@@ -60,28 +64,32 @@
       register: current_wal_level
       changed_when: false
 
-    - name: "[PREFLIGHT] wal_level atual: {{ current_wal_level.stdout }}"
+    - name: "[PREFLIGHT] wal_level status"
       ansible.builtin.debug:
-        msg: "wal_level atual: {{ current_wal_level.stdout }} → alvo: {{ pg_wal_level }}"
+        msg: "wal_level atual: {{ current_wal_level.stdout }} → alvo: {{ _wal_level_target }}"
 
-    - name: "[PREFLIGHT] Nada a fazer — wal_level já é {{ pg_wal_level }}"
+    - name: "[PREFLIGHT] Nada a fazer — wal_level já é {{ _wal_level_target }}"
       ansible.builtin.meta: end_play
-      when: current_wal_level.stdout == pg_wal_level
+      when: current_wal_level.stdout == _wal_level_target
 
 # =============================================================================
 # FASE 2 — Aplicar wal_level no DCS via patronictl edit-config
 # =============================================================================
-- name: "WAL LEVEL [2/3] — Aplicar {{ pg_wal_level }} no DCS"
+- name: "WAL LEVEL [2/3] — Aplicar wal_level no DCS"
   hosts: pg_cluster
   become: true
   gather_facts: false
   run_once: true
   tasks:
 
-    - name: "[CONFIG] Patch wal_level={{ pg_wal_level }} no DCS"
+    - name: "[CONFIG] Resolver variável alvo"
+      ansible.builtin.set_fact:
+        _wal_level_target: "{{ pg_wal_level | default('logical') }}"
+
+    - name: "[CONFIG] Patch wal_level no DCS"
       ansible.builtin.shell: |
         patronictl -c /etc/patroni/patroni.yml edit-config \
-          --patch '{"postgresql": {"parameters": {"wal_level": "{{ pg_wal_level }}"}}}' \
+          --patch '{"postgresql": {"parameters": {"wal_level": "{{ _wal_level_target }}"}}}' \
           --force
       become_user: postgres
       register: edit_result
@@ -122,6 +130,10 @@
   gather_facts: false
   run_once: true
   tasks:
+
+    - name: "[RESTART] Resolver variável alvo"
+      ansible.builtin.set_fact:
+        _wal_level_target: "{{ pg_wal_level | default('logical') }}"
 
     - name: "[RESTART] Iniciar rolling restart via patronictl"
       ansible.builtin.shell: |
@@ -174,8 +186,8 @@
 
     - name: "[VERIFY] Falha: wal_level incorreto em {{ item.item }}"
       ansible.builtin.fail:
-        msg: "Esperado '{{ pg_wal_level }}', encontrado '{{ item.stdout }}' em {{ item.item }}"
-      when: item.stdout != pg_wal_level
+        msg: "Esperado '{{ _wal_level_target }}', encontrado '{{ item.stdout }}' em {{ item.item }}"
+      when: item.stdout != _wal_level_target
       loop: "{{ final_wal_level.results }}"
       loop_control:
         label: "{{ item.item }}"
@@ -187,6 +199,6 @@
       register: final_topo
       changed_when: false
 
-    - name: "[VERIFY] Cluster OK — wal_level={{ pg_wal_level }}"
+    - name: "[VERIFY] Cluster OK — wal_level={{ _wal_level_target }}"
       ansible.builtin.debug:
         msg: "{{ final_topo.stdout_lines }}"
