@@ -1,0 +1,134 @@
+---
+# =============================================================================
+# roles/databases/tasks/main.yml
+# PURPOSE: Create tablespaces, databases and users (primary node only).
+#          Generates a SQL script and executes it via psql for reliability.
+# =============================================================================
+
+# ---------- Wait for PostgreSQL to be ready ----------
+- name: "[DB] Wait for Patroni API (port 8008)"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ patroni_port }}"
+    timeout: 120
+  tags: databases
+
+- name: "[DB] Wait for PostgreSQL to accept connections (port 5432)"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ pg_port }}"
+    timeout: 120
+  tags: databases
+
+- name: "[DB] Wait for Patroni to confirm this node is primary"
+  ansible.builtin.shell: |
+    patronictl -c /etc/patroni/patroni.yml list --format json \
+      | python3 -c "
+    import json, sys
+    nodes = json.load(sys.stdin)
+    primary = [n for n in nodes if n.get('Role') == 'Leader' and n.get('State') == 'running']
+    sys.exit(0 if primary else 1)
+    "
+  become_user: postgres
+  register: patroni_ready
+  retries: 20
+  delay: 6
+  until: patroni_ready.rc == 0
+  changed_when: false
+  tags: databases
+
+# ---------- Ensure tablespace directories exist and are owned by postgres ----------
+- name: "[DB] Ensure tablespace directories exist with correct ownership"
+  ansible.builtin.file:
+    path: "/pgdata/{{ item.name }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+  loop: "{{ databases }}"
+  loop_control:
+    label: "/pgdata/{{ item.name }}"
+  tags: databases
+
+# ---------- Clean stale tablespace marker dirs from previous cluster init ----------
+- name: "[DB] Remove stale PostgreSQL tablespace marker directories (PG_*)"
+  ansible.builtin.shell: |
+    find /pgdata/{{ item.name }} -maxdepth 1 -name 'PG_*' -type d -exec rm -rf {} + 2>/dev/null || true
+  loop: "{{ databases }}"
+  loop_control:
+    label: "/pgdata/{{ item.name }}"
+  changed_when: false
+  tags: databases
+
+# ---------- Generate and execute SQL initialization script ----------
+- name: "[DB] Generate SQL initialization script"
+  ansible.builtin.template:
+    src: init_databases.sql.j2
+    dest: /tmp/init_databases.sql
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  tags: databases
+
+- name: "[DB] Execute SQL initialization script via psql"
+  ansible.builtin.shell: |
+    psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/init_databases.sql 2>&1
+  become_user: postgres
+  register: sql_result
+  changed_when: "'CREATE' in sql_result.stdout or 'created' in sql_result.stdout"
+  tags: databases
+
+- name: "[DB] Show SQL execution output"
+  ansible.builtin.debug:
+    msg: "{{ sql_result.stdout_lines }}"
+  tags: databases
+
+# ---------- Schema-level grants (must run connected to each database) ----------
+- name: "[DB] Apply schema-level grants per database"
+  ansible.builtin.shell: |
+    psql -U postgres -d {{ item.0.name }} -c "
+    {% for user in item.0.users %}
+    {% if user.role == 'admin' %}
+    GRANT ALL ON SCHEMA public TO {{ user.name }};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {{ user.name }};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {{ user.name }};
+    {% elif user.role == 'readwrite' %}
+    GRANT USAGE ON SCHEMA public TO {{ user.name }};
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {{ user.name }};
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO {{ user.name }};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {{ user.name }};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO {{ user.name }};
+    {% elif user.role == 'readonly' %}
+    GRANT USAGE ON SCHEMA public TO {{ user.name }};
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO {{ user.name }};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {{ user.name }};
+    {% endif %}
+    {% endfor %}
+    " 2>&1
+  become_user: postgres
+  loop: "{{ databases | subelements('users') }}"
+  loop_control:
+    label: "{{ item.0.name }} → {{ item.1.name }} ({{ item.1.role }})"
+  changed_when: false
+  tags: databases
+
+# ---------- Cleanup ----------
+- name: "[DB] Remove SQL script (contains passwords)"
+  ansible.builtin.file:
+    path: /tmp/init_databases.sql
+    state: absent
+  tags: databases
+
+# ---------- Summary ----------
+- name: "[DB] Show created databases"
+  ansible.builtin.shell: |
+    psql -U postgres -c "\l" 2>&1
+  become_user: postgres
+  register: db_list
+  changed_when: false
+  tags: databases
+
+- name: "[DB] Database list"
+  ansible.builtin.debug:
+    msg: "{{ db_list.stdout_lines }}"
+  tags: databases
