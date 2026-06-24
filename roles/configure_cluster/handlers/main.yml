@@ -5,19 +5,16 @@
     daemon_reload: true
 
 - name: restart patroni
-  ansible.builtin.systemd:
-    name: patroni
-    state: restarted
-    enabled: true
+  ansible.builtin.shell: |
+    systemctl is-active --quiet patroni && systemctl restart patroni || true
+  changed_when: false
 
 - name: restart etcd
-  ansible.builtin.systemd:
-    name: etcd
-    state: restarted
-    enabled: true
+  ansible.builtin.shell: |
+    systemctl is-active --quiet etcd && systemctl restart etcd || true
+  changed_when: false
 
 - name: restart keepalived
-  ansible.builtin.systemd:
-    name: keepalived
-    state: restarted
-    enabled: true
+  ansible.builtin.shell: |
+    systemctl is-active --quiet keepalived && systemctl restart keepalived || true
+  changed_when: false
